@@ -4,6 +4,7 @@
 import sys
 import time
 import serial
+import serial.tools.list_ports
 import logging
 from logging.handlers import RotatingFileHandler
 import argparse
@@ -18,34 +19,121 @@ from matplotlib.dates import num2date, MinuteLocator, SecondLocator, DateFormatt
 from matplotlib.widgets import Button
 from datetime import datetime, timedelta
 from threading import Thread
-from os import path
+import os
+import configparser
+import inspect
+import easygui
+
 
 version = '1.0.7'
 
 port = ''
-baud = 115200
+#baud = 115200
 
-logfile = 'current_viewer.log'
+#logfile = 'current_viewer.log'
 
-refresh_interval = 66 # 66ms = 15fps
+#refresh_interval = 66 # 66ms = 15fps
 
 # controls the window size (and memory usage). 100k samples = 3 minutes
-buffer_max_samples = 100000
+#buffer_max_samples = 100000
 
 # controls how many samples to display in the chart (and CPU usage). Ie 4k display should be ok with 2k samples
-chart_max_samples = 2048
+#chart_max_samples = 2048
 
-# how many samples to average (median) 
-max_supersampling = 16;
+# how many samples to average (median)
+#max_supersampling = 16;
 
 # set to true to compute median instead of average (less noise, more CPU)
-median_filter = 0;
+#median_filter = 0;
 
 # 
 save_file = None;
 save_format = None;
 
 connected_device = "CurrentRanger"
+
+
+#########################################################################################################
+Config = configparser.ConfigParser()
+
+if sys.platform.startswith('win'):
+    filename = inspect.getframeinfo(inspect.currentframe()).filename
+    settingsFilename = os.path.join(os.path.dirname(os.path.abspath(filename)), 'Config.txt')
+else:
+    settingsFilename = os.path.join(sys.path[0], 'Config.txt')
+
+Config.read(settingsFilename)
+logger = logging.getLogger("main_logger")
+# disable matplotlib logging for fonts, seems to be quite noisy
+logging.getLogger('matplotlib.font_manager').disabled = True
+#########################################################################################################
+
+def ConfigSectionMap(section):
+    dict1 = {}
+    options = Config.options(section)
+    for option in options:
+        try:
+            dict1[option] = Config.get(section, option)
+            if dict1[option] == -1:
+                logger.debug("skip: %s" % option)
+        except:
+            print("exception on %s!" % option)
+            dict1[option] = None
+    return dict1
+
+def configure_logging(location, name, level, logger):
+    logDIR = ConfigSectionMap("Configuration")['log_location']
+    logFormatter = logging.Formatter("%(asctime)s [%(levelname)s]  %(message)s")
+    if not os.path.exists(logDIR):
+        os.makedirs(logDIR)
+    logname = '{3}/{0}-{1}-{2}.txt'.format(location, name, datetime.strftime(datetime.today(), '%d-%m-%Y'), logDIR)
+    if os.path.isfile(logname):
+        newlog = False
+    else:
+        newlog = True
+
+    if level == 'INFO':
+        print('got into info area')
+        fileHandler = logging.FileHandler(logname)
+        fileHandler.setLevel(logging.INFO)
+        fileHandler.setFormatter(logFormatter)
+
+    elif level == 'DEBUG':
+        fileHandler = logging.FileHandler(logname)
+        fileHandler.setLevel(logging.DEBUG)
+        fileHandler.setFormatter(logFormatter)
+        logger.addHandler(fileHandler)
+
+        logging.basicConfig(filename='debug.log', level=logging.DEBUG)
+        consoleHandler = logging.StreamHandler(sys.stdout)
+        consoleHandler.setLevel(logging.DEBUG)
+        consoleHandler.setFormatter(logFormatter)
+        logger.addHandler(consoleHandler)
+
+
+# !/usr/bin/python3
+class ReadLine:
+    def __init__(self, s):
+        self.buf = bytearray()
+        self.s = s
+
+    def readline(self):
+        i = self.buf.find(b"\n")
+        if i >= 0:
+            r = self.buf[:i + 1]
+            self.buf = self.buf[i + 1:]
+            return r
+        while True:
+            i = max(1, min(2048, self.s.in_waiting))
+            data = self.s.read(i)
+            i = data.find(b"\n")
+            if i >= 0:
+                r = self.buf + data[:i + 1]
+                self.buf[0:] = data[i + 1:]
+                return r
+            else:
+                self.buf.extend(data)
+
 
 class CRPlot:
     def __init__(self, sample_buffer = 100):
@@ -233,6 +321,7 @@ class CRPlot:
 
                 line = line.decode(encoding="ascii", errors="strict")
 
+                # TODO remove this, not needed in the new setup
                 if (line.startswith("USB_LOGGING")):
                     if (line.startswith("USB_LOGGING_DISABLED")):
                         # must have been left open by a different process/instance
@@ -372,123 +461,98 @@ class CRPlot:
 
         logging.info("Connection closed.")
 
+def serial_ports():
+    """ Lists serial port names
 
-def init_argparse() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        usage="%(prog)s -p <port> [OPTION]",
-        description="CurrentRanger R3 Viewer"
-    )
+        :raises EnvironmentError:
+            On unsupported or unknown platforms
+        :returns:
+            A list of the serial ports available on the system
+    """
+    if sys.platform.startswith('win'):
+        logger.debug("Found a windows machine")
+    elif sys.platform.startswith('linux'):
+        logger.debug("Found a linux machine")
+    else:
+        logger.error("Found a {} machine".format(sys.platform))
+        raise EnvironmentError('Unsupported platform')
 
-    parser.add_argument("--version", action="version", version = f"{parser.prog} version {version}")
-    parser.add_argument("-p", "--port", nargs=1, required=True, help="Set the serial port (backed by USB or BlueTooth) to connect to (example: /dev/ttyACM0 or COM3)")
-    parser.add_argument("-s", "--baud", metavar='<n>', type=int, nargs=1, help=f"Set the serial baud rate (default: {baud})")
-
-    parser.add_argument("-o", "--out", metavar='<file>', nargs=1, help=f"Save the output samples to <file> in the format set by --format")
-    parser.add_argument("--format", metavar='<fmt>', nargs=1, help=f"Set the output format to one of: CSV, JSON")
-
-    parser.add_argument("--gui", dest="gui", action="store_true", default=True, help="Display the GUI / Interactive chart (default: ON)")
-    parser.add_argument("-g", "--no-gui", dest="gui", action="store_false", help="Do not display the GUI / Interactive Chart. Useful for automation")
-
-    parser.add_argument("-b", "--buffer", metavar='<samples>', type=int, nargs=1, help=f"Set the chart buffer size (window size) in # of samples (default: {buffer_max_samples})")
-    parser.add_argument("-m", "--max-chart", metavar='<samples>', type=int, nargs=1, help=f"Set the chart max # samples displayed (default: {chart_max_samples})")
-    parser.add_argument("-r", "--refresh", metavar='<ms>', type=int, nargs=1, help=f"Set the live chart refresh interval in milliseconds (default: {refresh_interval})")
-    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase logging verbosity (can be specified multiple times)")
-    parser.add_argument("-c", "--console", default=False, action="store_true", help="Show the debug messages on the console")
-    parser.add_argument("-n", "--no-log", default=False, action="store_true", help=f"Disable debug logging (enabled by default)")
-    parser.add_argument("--log-size", metavar='<Mb>', type=float, nargs=1, help=f"Set the log maximum size in megabytes (default: 1Mb)")
-    parser.add_argument("-l", "--log-file", nargs=1, help=f"Set the debug log file name (default:{logfile})")
-
-    parser.set_defaults(gui=True)
-    return parser
+    result = []
+    for port in serial.tools.list_ports.comports():
+        logger.debug("""mfg: {}\r
+                        VID: {}\r
+                        PID: {}\r
+                        port: {}
+                        """.format(port.manufacturer, port.vid, port.pid, port.device))
+        if port.vid != 0x04d8 and port.pid != 0xee4c:
+            try:
+                s = serial.Serial(port.device)
+                s.close()
+                result.append(port.device)
+            except (OSError, serial.SerialException):
+                raise
+    return result
 
 def main():
 
     print("CurrentViewer v" + version)
 
-    log_size = 1024*1024;
+    log_size = 1024*1024
 
-    parser = init_argparse()
-    args = parser.parse_args()
+    log_size = ConfigSectionMap("Configuration")['log_size']
 
-    if args.log_file:
-        global logfile
-        logfile = args.log_file[0]
+    global refresh_interval
+    refresh_interval = ConfigSectionMap("Configuration")['refresh_interval']
 
-    if args.log_size:
-        log_size = 1024*1024*args.log_size[0]
+    global baud
+    baud = ConfigSectionMap("Configuration")['baud']
 
-    if args.refresh:
-        global refresh_interval
-        refresh_interval = args.refresh[0]
-
-    if args.baud:
-        global baud
-        baud = args.baud[0]
-
-    if args.max_chart and args.max_chart[0] > 10:
+    max_chart = ConfigSectionMap("Configuration")['max_chart']
+    if int(max_chart) and int(max_chart[0]) > 0:
         global chart_max_samples
-        chart_max_samples = args.max_chart[0]
+        chart_max_samples  = int(ConfigSectionMap("Configuration")['chart_max_samples'])
 
-    if args.buffer:
-        global buffer_max_samples
-        buffer_max_samples = args.buffer[0]
-        if buffer_max_samples < chart_max_samples:
-            print("Command line error: Buffer size cannot be smaller than the chart sample size", file=sys.stderr)
-            return -1
 
-    logging_level = logging.DEBUG if args.verbose>2 else (logging.INFO if args.verbose>1 else (logging.WARNING if args.verbose>0 else logging.ERROR))
-
-    # disable matplotlib logging for fonts, seems to be quite noisy
-    logging.getLogger('matplotlib.font_manager').disabled = True
-
-    if args.console or not args.no_log:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if not args.no_log:
-        file_logger = RotatingFileHandler(logfile, maxBytes=log_size, backupCount=1)
-        file_logger.setLevel(logging.DEBUG)
-        file_logger.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s:%(threadName)s:%(message)s'))
-        logging.getLogger().addHandler(file_logger)
-
-    if args.console:
-        print("Setting console logging")
-        console_logger = logging.StreamHandler()
-        console_logger.setLevel(logging_level)
-        console_logger.setFormatter(logging.Formatter('%(levelname)s:%(message)s'))
-        logging.getLogger().addHandler(console_logger)
+    global buffer_max_samples
+    buffer_max_samples = int(ConfigSectionMap("Configuration")['buffer_max_samples'])
+    if buffer_max_samples < chart_max_samples:
+        print("Command line error: Buffer size cannot be smaller than the chart sample size", file=sys.stderr)
+        return -1
 
 
     global save_file
     global save_format
 
-    if args.format:
-        save_format = args.format[0].upper()
-        if not save_format in ["CSV", "JSON"]:
-            print(f"Unknown format {save_format}", file=sys.stderr)
-            return -2
+    save_format = ConfigSectionMap("Configuration")['format']
+    save_format = save_format.upper()
+    if not save_format in ["CSV", "JSON"]:
+        print(f"Unknown format {save_format}", file=sys.stderr)
+        return -2
 
-    if args.out:
-        output_file_name = args.out[0]
-        save_file = open(output_file_name, "w+")
+    output_file_name = easygui.filesavebox(msg=None, title=None, default='', filetypes=None)
 
-        if not save_format:
-            save_format = 'CSV' if output_file_name.upper().endswith('.CSV') else 'JSON'
-            logging.info(f"Save format automatically set to {save_format} for {args.out[0]}")
+    save_file = open(output_file_name, "w+")
+    if not save_format:
+        save_format = 'CSV' if output_file_name.upper().endswith('.CSV') else 'JSON'
+        logging.info(f"Save format automatically set to {save_format} for {save_file}")
 
-        if save_format == 'CSV':
-            save_file.write("Timestamp, Amps\n")
-        elif save_format == 'JSON':
-            save_file.write("{\n\"data\":[\n")
+    if save_format == 'CSV':
+        save_file.write("Timestamp, Amps\n")
+    elif save_format == 'JSON':
+        save_file.write("{\n\"data\":[\n")
 
     logging.info("CurrentViewer v{}. System: {}, Platform: {}, Machine: {}, Python: {}".format(version, platform.system(), platform.platform(), platform.machine(), platform.python_version()))
 
     csp = CRPlot(sample_buffer=buffer_max_samples)
-
-    if csp.serialStart(port=args.port[0], speed=baud):
-        if args.gui:
+    serialport = serial_ports()[0]
+    if csp.serialStart(port=serialport, speed=baud):
+        msg = "Do you want to view and log data, or only datalog"
+        title = "Please Confirm"
+        choice = easygui.buttonbox(msg, title, choices=['View + Log', 'Datalog'])
+        if choice == 'View + Log':
             print("Starting live chart...")
             csp.chartSetup(refresh_interval=refresh_interval)
-        else:
+        elif choice == 'Datalog':
             print("Running with no GUI (press Ctrl-C to stop)...")
             try:
                 while csp.isStreaming():
@@ -499,7 +563,7 @@ def main():
 
             print("Done.")
     else:
-        print("Fatal: Could not connect to USB/BT COM port {}. Check the logs for more information".format(args.port[0]), file=sys.stderr)
+        logger.error("Fatal: Could not connect to USB/BT COM port {}. Check the logs for more information".format(serialport))
 
     csp.close()
 

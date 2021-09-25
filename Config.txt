@@ -1,0 +1,29 @@
+[Configuration]
+Location = Matts Desk
+Name = Keypad Mount
+logging = DEBUG
+firmware = HHI
+log_location = ./Logs
+log_size = 1048576
+
+# refresh_interval 66ms = 15fps
+refresh_interval = 66
+
+# controls the window size (and memory usage). 100k samples = 3 minutes
+buffer_max_samples = 100001
+
+# controls how many samples to display in the chart (and CPU usage). Ie 4k display should be ok with 2k samples
+chart_max_samples = 100000
+
+# how many samples to average (median)
+max_supersampling = 16;
+
+# set to true to compute median instead of average (less noise, more CPU)
+median_filter = 0;
+
+baud = 115200
+
+# Set the chart max number of samples displayed
+max_chart = 100000
+
+format = CSV
